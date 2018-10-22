@@ -9,38 +9,50 @@ var JSONStream = require('JSONStream');
 var url = require('url');
 
 
-// Set LOGGLY_TOKEN to your Loggly customer token. It will look something like this:
-// LOGGLY_TOKEN = 'some token';
-// Preferably, you should set the tag 'loggly-customer-tag' on the S3 bucket.
-
-// Optionally set a LOGGLY_TAG if you want to tag these logs in a certain way. For example:
-// LOGGLY_TAG = 'aws-elb-logs'
-// Preferably, you should set the 'loggly-tag' on the S3 bucket.
-
 var LOGGLY_URL_BASE = 'https://logs-01.loggly.com/bulk/';
-var BUCKET_LOGGLY_TOKEN_NAME = 'loggly-customer-token';
-var BUCKET_LOGGLY_TAG_NAME = 'loggly-tag';
-var BUCKET_LOGGLY_PRIVATE_URL_PARAMS_NAME = 'loggly-private-params';
 
-var LOGGLY_URL = null;
-var DEFAULT_LOGGLY_URL = null;
 
-/* eslint-disable no-undef */
-if (typeof LOGGLY_TOKEN !== 'undefined') {
-  DEFAULT_LOGGLY_URL = LOGGLY_URL_BASE + LOGGLY_TOKEN;
 
-  if (typeof LOGGLY_TAG !== 'undefined') {
-    DEFAULT_LOGGLY_URL += '/tag/' + LOGGLY_TAG;
-  }
-}
-/* eslint-enable no-undef */
+// Set LOGGLY_TOKEN to your Loggly customer token.
+var LOGGLY_TOKEN = process.env.LOGGLY_TOKEN || '';
+// Optionally set a LOGGLY_TAG if you want to tag these logs in a certain way. For example: 'aws-elb-logs'
+var LOGGLY_TAG = process.env.LOGGLY_TAG || '';
 
-if (DEFAULT_LOGGLY_URL) {
-  console.log('Loading elb2loggly, default Loggly endpoint: ' + DEFAULT_LOGGLY_URL);
-} else {
-  console.log('Loading elb2loggly, NO default Loggly endpoint, must be set in bucket tag ' + BUCKET_LOGGLY_TOKEN_NAME);
+var LOGGLY_PRIVATE_URL_PARAMS = process.env.LOGGLY_PRIVATE_URL_PARAMS || '';
+var USER_KEY_LENGTH = process.env.USER_KEY_LENGTH || 32;
+//var SKIP_URLS_INCLUDES = process.env.SKIP_URLS_INCLUDES || ''; // TODO: move skipping urls to env variables
+
+var LOGGLY_URL = LOGGLY_URL_BASE + LOGGLY_TOKEN;
+
+if (LOGGLY_TAG) {
+    LOGGLY_URL += '/tag/' + LOGGLY_TAG;
 }
 
+if (LOGGLY_TOKEN) {
+    console.log('Loading elb2loggly, with Loggly token: ' + LOGGLY_TOKEN);
+}
+
+// Private query parameters that should be removed/obscured from the URL
+var PRIVATE_URL_PARAMS = [];
+var PRIVATE_URL_PARAMS_MAX_LENGTH = [];
+var SKIP_URLS_INCLUDES = ['/static/', '/healthcheck'];
+
+var privateParamEntries = LOGGLY_PRIVATE_URL_PARAMS.split(/\/\//g);
+
+_.each(privateParamEntries, function(entry) {
+    // The parameter name and max length is separated by a single forward slash
+    var entrySplit = entry.split(/\//g);
+    var paramName = entrySplit[0];
+    var paramMaxLength = parseInt(entrySplit[1], 10);
+
+    if (paramName && paramMaxLength) {
+        console.log('Private url parameter ' + paramName + ' will be obscured with max length ' + paramMaxLength + '.');
+
+        PRIVATE_URL_PARAMS.push(paramName);
+        PRIVATE_URL_PARAMS_MAX_LENGTH.push(paramMaxLength);
+    }
+
+});
 
 
 // AWS logs contain the following fields: (Note: a couple are parsed from within the field.)
@@ -81,10 +93,6 @@ var NUMERIC_COL_INDEX = [
 var eventsParsed = 0;
 var eventsSkipped = 0;
 
-// Private query parameters that should be removed/obscured from the URL
-var PRIVATE_URL_PARAMS = [];
-var PRIVATE_URL_PARAMS_MAX_LENGTH = [];
-var SKIP_URLS_INCLUDES = ['/static/', '/internal/', '/healthcheck'];
 
 // Obscures the provided parameter in the URL
 // Returns the URL with the provided parameter obscured
@@ -209,8 +217,9 @@ var parseS3Log = function(data, encoding, done) {
 
         var re = /user_key=(\w{32})/;
         var m;
+        var path = url.parse(originalUrl).path;
 
-        if ((m = re.exec(url.parse(originalUrl).path)) !== null) {
+        if ((m = re.exec(path)) !== null) {
           if (m.index === re.lastIndex) {
             re.lastIndex++;
           }
@@ -218,12 +227,13 @@ var parseS3Log = function(data, encoding, done) {
 
         var ret = _.zipObject(COLUMNS, data);
 
-        ret['derived'] = {};
+        ret['derived'] = {
+          path: path,
+          widget: path.indexOf('internal') > 0
+        };
 
         if (m) {
-          ret['derived'] = {
-            user_key: m[1]
-          }
+          ret['derived'].user_key = m[1].substring(0, USER_KEY_LENGTH)
         }
 
         this.push(ret);
@@ -268,55 +278,6 @@ exports.handler = function(event, context) {
   } else {
        // Download the logfile from S3, and upload to loggly.
     async.waterfall([
-      function buckettags(next) {
-        var params = {
-          Bucket: bucket /* required */
-        };
-
-        s3.getBucketTagging(params, function(err, data) {
-          if (err) {
-            next(err);
-            console.log(err, err.stack);
-          } else {
-              // Get an array of bucket tags
-            var s3tag = _.zipObject(_.map(data.TagSet, 'Key'),
-             _.map(data.TagSet, 'Value'));
-
-              // If the 'token' tag is set we use that
-            if (s3tag[BUCKET_LOGGLY_TOKEN_NAME]) {
-              LOGGLY_URL = LOGGLY_URL_BASE + s3tag[BUCKET_LOGGLY_TOKEN_NAME];
-
-                // If the 'loggly tag' tag is set we use that
-              if (s3tag[BUCKET_LOGGLY_TAG_NAME]) {
-                LOGGLY_URL += '/tag/' + s3tag[BUCKET_LOGGLY_TAG_NAME];
-              }
-            } else {
-              LOGGLY_URL = DEFAULT_LOGGLY_URL;
-            }
-          }
-
-            // If the 'private url params' tag set we parse that
-          if (s3tag[BUCKET_LOGGLY_PRIVATE_URL_PARAMS_NAME]) {
-              // First we split on double forward slash
-            var privateParamEntries = s3tag[BUCKET_LOGGLY_PRIVATE_URL_PARAMS_NAME].split(/\/\//g);
-            _.each(privateParamEntries, function(entry) {
-                // The parameter name and max length is separated by a single forward slash
-              var entrySplit = entry.split(/\//g);
-              var paramName = entrySplit[0];
-              var paramMaxLength = parseInt(entrySplit[1], 10);
-              console.log('Private url parameter ' + paramName + ' will be obscured with max length ' + paramMaxLength + '.');
-              PRIVATE_URL_PARAMS.push(paramName);
-              PRIVATE_URL_PARAMS_MAX_LENGTH.push(paramMaxLength);
-            });
-          }
-
-          if (LOGGLY_URL) {
-            next();
-          } else {
-            next('No Loggly customer token. Set S3 bucket tag ' + BUCKET_LOGGLY_TOKEN_NAME);
-          }
-        });
-      },
 
       function download(next) {
           // Download the image from S3 into a buffer.
@@ -369,10 +330,9 @@ exports.handler = function(event, context) {
 
 
 
-
-
 // start console testing
 
+/*
 var program = require('commander');
 var fs = require("fs");
 
@@ -412,6 +372,6 @@ program
   .action(loadLog);
 
 program.parse(process.argv);
-
+*/
 
 // end console testing block
